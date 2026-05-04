@@ -14,7 +14,6 @@
     color: #e0e0e0;
     display: flex;
     height: 100vh;
-    overflow: hidden;
   }
 
   #sidebar {
@@ -26,7 +25,6 @@
     display: flex;
     flex-direction: column;
     gap: 20px;
-    overflow-y: auto;
   }
 
   h1 { font-size: 16px; font-weight: 600; color: #fff; }
@@ -48,6 +46,8 @@
   button:disabled { opacity: 0.4; cursor: default; }
   button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
   button.primary:hover:not(:disabled) { background: #1d4ed8; }
+  button.danger  { background: #dc2626; border-color: #dc2626; color: #fff; }
+  button.danger:hover:not(:disabled)  { background: #b91c1c; }
 
   #status-badge {
     display: flex;
@@ -64,60 +64,32 @@
     flex-shrink: 0;
     background: #555;
   }
-  #status-badge.idle #status-dot    { background: #555; }
-  #status-badge.adv #status-dot     { background: #f59e0b; }
-  #status-badge.conn #status-dot    { background: #22c55e; }
-  #status-badge.disc #status-dot    { background: #ef4444; }
-
-  .input-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .input-row label { color: #999; font-size: 12px; white-space: nowrap; }
-  .input-row input {
-    flex: 1;
-    min-width: 0;
-    padding: 5px 8px;
-    border-radius: 5px;
-    border: 1px solid #444;
-    background: #1a1a1a;
-    color: #e0e0e0;
-    font-size: 13px;
-  }
-  .input-row input:focus { outline: none; border-color: #2563eb; }
-  .sep { color: #666; }
+  #status-badge.idle #status-dot { background: #555; }
+  #status-badge.adv  #status-dot { background: #f59e0b; }
+  #status-badge.conn #status-dot { background: #22c55e; }
+  #status-badge.disc #status-dot { background: #ef4444; }
 
   #main {
     flex: 1;
     display: flex;
-    align-items: flex-start;
-    justify-content: flex-start;
-    padding: 20px;
-    overflow: auto;
-  }
-
-  #mirror {
-    background: #111;
-    border: 2px solid #333;
-    border-radius: 4px;
-    cursor: crosshair;
-    user-select: none;
-    outline: none;
-    flex-shrink: 0;
-    position: relative;
-  }
-  #mirror:focus { border-color: #2563eb; }
-  #mirror.connected { border-color: #22c55e44; }
-  #mirror-hint {
-    position: absolute;
-    inset: 0;
-    display: flex;
     align-items: center;
     justify-content: center;
-    color: #444;
-    font-size: 13px;
-    pointer-events: none;
+  }
+
+  #capture-indicator {
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    color: #22c55e;
+  }
+  #capture-indicator.active { display: flex; }
+  #capture-indicator .icon { font-size: 48px; animation: pulse 1.5s ease-in-out infinite; }
+  #capture-indicator .label { font-size: 13px; color: #666; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.4; }
   }
 </style>
 </head>
@@ -137,26 +109,15 @@
   </div>
 
   <div class="section">
-    <div class="section-title">Target Resolution</div>
-    <div class="input-row">
-      <input id="res-w" type="number" value="2360" min="1" max="9999">
-      <span class="sep">×</span>
-      <input id="res-h" type="number" value="1640" min="1" max="9999">
-    </div>
-  </div>
-
-  <div class="section">
-    <div class="section-title">Mirror Width (px)</div>
-    <div class="input-row">
-      <input id="mirror-w" type="number" value="600" min="100" max="3000">
-      <label>px</label>
-    </div>
+    <div class="section-title">Keyboard</div>
+    <button id="btn-capture" disabled>Start Capture</button>
   </div>
 </div>
 
 <div id="main">
-  <div id="mirror" tabindex="0">
-    <div id="mirror-hint">Move cursor here to control target device</div>
+  <div id="capture-indicator">
+    <div class="icon">⌨</div>
+    <div class="label">Forwarding all keystrokes</div>
   </div>
 </div>
 
@@ -198,21 +159,18 @@ const KEY_MAP = {
   Numpad1:0x59, Numpad2:0x5A, Numpad3:0x5B, Numpad4:0x5C,
   Numpad5:0x5D, Numpad6:0x5E, Numpad7:0x5F, Numpad8:0x60,
   Numpad9:0x61, Numpad0:0x62, NumpadDecimal:0x63,
-  // PrintScreen / Scroll / Pause
   PrintScreen:0x46, ScrollLock:0x47, Pause:0x48,
 };
 
 // ─── Serial state ────────────────────────────────────────────────────────────
 
-let port = null;
+let port   = null;
 let writer = null;
-let serialConnected = false;
 
-// ─── Input state ─────────────────────────────────────────────────────────────
+// ─── Capture state ───────────────────────────────────────────────────────────
 
-let mouseButtons = 0;
+let capturing  = false;
 let currentMod = 0;
-let lastHID = { x: 0, y: 0 };
 
 // ─── Protocol helpers ────────────────────────────────────────────────────────
 
@@ -221,64 +179,68 @@ function sendBytes(arr) {
   writer.write(new Uint8Array(arr)).catch(() => {});
 }
 
-function sendMouseMove(hx, hy, buttons, wheel) {
-  const w = wheel < 0 ? wheel + 256 : wheel;
-  sendBytes([0x02, buttons, hx & 0xFF, hx >> 8, hy & 0xFF, hy >> 8, w]);
+function sendKeyDown(mod, kc) { sendBytes([0x03, mod, kc]); }
+function sendKeyUp(mod, kc)   { sendBytes([0x04, mod, kc]); }
+function sendReleaseAll()      { sendBytes([0x05]); }
+function sendAdvertise()       { sendBytes([0x01]); }
+
+// ─── Capture toggle ──────────────────────────────────────────────────────────
+
+const btnCapture       = document.getElementById('btn-capture');
+const captureIndicator = document.getElementById('capture-indicator');
+
+function setCapturing(on) {
+  capturing = on;
+  if (on) {
+    btnCapture.textContent = 'Stop Capture';
+    btnCapture.classList.add('danger');
+    captureIndicator.classList.add('active');
+    currentMod = 0;
+  } else {
+    sendReleaseAll();
+    currentMod = 0;
+    btnCapture.textContent = 'Start Capture';
+    btnCapture.classList.remove('danger');
+    captureIndicator.classList.remove('active');
+  }
 }
 
-function sendMouseButtons(buttons) {
-  sendBytes([0x06, buttons]);
-}
+btnCapture.addEventListener('click', () => setCapturing(!capturing));
 
-function sendKeyDown(mod, kc) {
-  sendBytes([0x03, mod, kc]);
-}
+// ─── Global keyboard capture ──────────────────────────────────────────────────
 
-function sendKeyUp(mod, kc) {
-  sendBytes([0x04, mod, kc]);
-}
+document.addEventListener('keydown', e => {
+  if (!capturing) return;
 
-function sendReleaseAll() {
-  sendBytes([0x05]);
-}
+  e.preventDefault();
 
-function sendAdvertise() {
-  sendBytes([0x01]);
-}
+  const modBit = MOD_MAP[e.code];
+  if (modBit) {
+    currentMod |= modBit;
+    sendKeyDown(currentMod, 0x00);
+    return;
+  }
+  const kc = KEY_MAP[e.code];
+  if (kc) sendKeyDown(currentMod, kc);
+});
 
-// ─── HID coordinate calculation ──────────────────────────────────────────────
+document.addEventListener('keyup', e => {
+  if (!capturing) return;
+  e.preventDefault();
 
-function getHIDCoords(e) {
-  const r = mirror.getBoundingClientRect();
-  const x = Math.max(0, Math.min(32767, Math.round((e.clientX - r.left) / r.width * 32767)));
-  const y = Math.max(0, Math.min(32767, Math.round((e.clientY - r.top) / r.height * 32767)));
-  return { x, y };
-}
-
-// ─── Mirror size ─────────────────────────────────────────────────────────────
-
-const mirror = document.getElementById('mirror');
-const resWInput = document.getElementById('res-w');
-const resHInput = document.getElementById('res-h');
-const mirrorWInput = document.getElementById('mirror-w');
-
-function updateMirrorSize() {
-  const rw = Math.max(1, parseInt(resWInput.value) || 1);
-  const rh = Math.max(1, parseInt(resHInput.value) || 1);
-  const mw = Math.max(100, parseInt(mirrorWInput.value) || 600);
-  const mh = Math.round(mw * rh / rw);
-  mirror.style.width = mw + 'px';
-  mirror.style.height = mh + 'px';
-}
-
-resWInput.addEventListener('input', updateMirrorSize);
-resHInput.addEventListener('input', updateMirrorSize);
-mirrorWInput.addEventListener('input', updateMirrorSize);
-updateMirrorSize();
+  const modBit = MOD_MAP[e.code];
+  if (modBit) {
+    currentMod &= ~modBit & 0xFF;
+    sendKeyUp(currentMod, 0x00);
+    return;
+  }
+  const kc = KEY_MAP[e.code];
+  if (kc) sendKeyUp(currentMod, kc);
+});
 
 // ─── Status display ──────────────────────────────────────────────────────────
 
-const badge = document.getElementById('status-badge');
+const badge      = document.getElementById('status-badge');
 const statusText = document.getElementById('status-text');
 
 function setStatus(cls, text) {
@@ -290,18 +252,21 @@ function handleStatusLine(line) {
   line = line.trim();
   if (line === 'IDLE')       setStatus('idle', 'Idle');
   else if (line === 'ADV')   setStatus('adv', 'Advertising…');
-  else if (line === 'DISC')  setStatus('disc', 'Disconnected');
-  else if (line.startsWith('CONN:')) {
+  else if (line === 'DISC') {
+    setStatus('disc', 'Disconnected');
+    setCapturing(false);
+    btnCapture.disabled = true;
+  } else if (line.startsWith('CONN:')) {
     const name = line.slice(5) || 'Unknown';
     setStatus('conn', 'Connected: ' + name);
-    mirror.classList.add('connected');
+    btnCapture.disabled = false;
   }
 }
 
 // ─── Serial connection ────────────────────────────────────────────────────────
 
 const btnConnect = document.getElementById('btn-connect');
-const btnPair = document.getElementById('btn-pair');
+const btnPair    = document.getElementById('btn-pair');
 
 btnConnect.addEventListener('click', connectSerial);
 btnPair.addEventListener('click', () => sendAdvertise());
@@ -315,7 +280,6 @@ async function connectSerial() {
     port = await navigator.serial.requestPort();
     await port.open({ baudRate: 115200 });
     writer = port.writable.getWriter();
-    serialConnected = true;
     btnConnect.disabled = true;
     btnPair.disabled = false;
     setStatus('idle', 'Idle');
@@ -343,77 +307,12 @@ async function readLoop() {
   } catch (e) {
     console.error(e);
   }
-  serialConnected = false;
+  setCapturing(false);
   btnConnect.disabled = false;
   btnPair.disabled = true;
+  btnCapture.disabled = true;
   setStatus('disc', 'Serial disconnected');
-  mirror.classList.remove('connected');
 }
-
-// ─── Mirror mouse events ──────────────────────────────────────────────────────
-
-mirror.addEventListener('mouseenter', () => mirror.focus());
-
-mirror.addEventListener('mouseleave', () => {
-  sendReleaseAll();
-  mouseButtons = 0;
-  currentMod = 0;
-});
-
-mirror.addEventListener('contextmenu', e => e.preventDefault());
-
-mirror.addEventListener('pointermove', e => {
-  const hid = getHIDCoords(e);
-  lastHID = hid;
-  sendMouseMove(hid.x, hid.y, mouseButtons, 0);
-});
-
-mirror.addEventListener('mousedown', e => {
-  e.preventDefault();
-  const bit = e.button === 0 ? 0x01 : e.button === 2 ? 0x02 : e.button === 1 ? 0x04 : 0;
-  mouseButtons |= bit;
-  sendMouseButtons(mouseButtons);
-});
-
-mirror.addEventListener('mouseup', e => {
-  const bit = e.button === 0 ? 0x01 : e.button === 2 ? 0x02 : e.button === 1 ? 0x04 : 0;
-  mouseButtons &= ~bit & 0xFF;
-  sendMouseButtons(mouseButtons);
-});
-
-mirror.addEventListener('wheel', e => {
-  e.preventDefault();
-  const delta = Math.max(-127, Math.min(127, Math.round(e.deltaY / 10)));
-  if (delta !== 0) {
-    sendMouseMove(lastHID.x, lastHID.y, mouseButtons, delta);
-  }
-}, { passive: false });
-
-// ─── Mirror keyboard events ───────────────────────────────────────────────────
-
-mirror.addEventListener('keydown', e => {
-  e.preventDefault();
-  const modBit = MOD_MAP[e.code];
-  if (modBit) {
-    currentMod |= modBit;
-    sendKeyDown(currentMod, 0x00);
-    return;
-  }
-  const kc = KEY_MAP[e.code];
-  if (kc) sendKeyDown(currentMod, kc);
-});
-
-mirror.addEventListener('keyup', e => {
-  e.preventDefault();
-  const modBit = MOD_MAP[e.code];
-  if (modBit) {
-    currentMod &= ~modBit & 0xFF;
-    sendKeyUp(currentMod, 0x00);
-    return;
-  }
-  const kc = KEY_MAP[e.code];
-  if (kc) sendKeyUp(currentMod, kc);
-});
 </script>
 </body>
 </html>

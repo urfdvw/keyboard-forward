@@ -1,111 +1,23 @@
-import struct
 import time
 import usb_cdc
 from adafruit_ble import BLERadio
 from adafruit_ble.advertising.standard import ProvideServicesAdvertisement
 from adafruit_ble.services.standard.hid import HIDService
+from adafruit_hid.keyboard import Keyboard
 
-# fmt: off
-HID_DESCRIPTOR = bytes([
-    # === Report ID 1: Keyboard ===
-    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01,
-    0x85, 0x01,
-    0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,
-    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
-    0x75, 0x08, 0x95, 0x01, 0x81, 0x01,
-    0x05, 0x08, 0x19, 0x01, 0x29, 0x05,
-    0x75, 0x01, 0x95, 0x05, 0x91, 0x02,
-    0x75, 0x03, 0x95, 0x01, 0x91, 0x01,
-    0x05, 0x07, 0x19, 0x00, 0x29, 0xFF,
-    0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x06, 0x81, 0x00,
-    0xC0,
-    # === Report ID 2: Absolute Mouse ===
-    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01,
-    0x85, 0x02,
-    0x09, 0x01, 0xA1, 0x00,
-    0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
-    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02,
-    0x75, 0x05, 0x95, 0x01, 0x81, 0x01,
-    0x05, 0x01, 0x09, 0x30,
-    0x15, 0x00, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02,
-    0x09, 0x31,
-    0x15, 0x00, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02,
-    0x09, 0x38,
-    0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
-    0xC0, 0xC0,
-])
-# fmt: on
+CMD_SIZES = {0x01: 0, 0x03: 2, 0x04: 2, 0x05: 0}
 
-# Payload bytes following each command byte (not counting the command byte itself)
-CMD_SIZES = {0x01: 0, 0x02: 6, 0x03: 2, 0x04: 2, 0x05: 0, 0x06: 1}
+ble = BLERadio()
+ble.name = "ForwardHID"
+hid = HIDService()
+advertisement = ProvideServicesAdvertisement(hid)
+keyboard = Keyboard(hid.devices)  # finds the correct HID device automatically
 
+serial = usb_cdc.data
+state = "IDLE"
+_conn_time = 0
+_current_mod = 0  # tracks modifier byte in sync with keyboard.report[0]
 
-class KbdState:
-    def __init__(self, dev):
-        self._dev = dev
-        self._report = bytearray(8)  # [modifier, reserved, key0..key5]
-
-    def key_down(self, modifier, keycode):
-        self._report[0] |= modifier
-        if keycode:
-            already_held = False
-            for i in range(2, 8):
-                if self._report[i] == keycode:
-                    already_held = True
-                    break
-            if not already_held:
-                for i in range(2, 8):
-                    if self._report[i] == 0:
-                        self._report[i] = keycode
-                        break
-        self._send()
-
-    def key_up(self, modifier, keycode):
-        self._report[0] &= ~modifier & 0xFF
-        if keycode:
-            for i in range(2, 8):
-                if self._report[i] == keycode:
-                    self._report[i] = 0
-                    break
-        self._send()
-
-    def release_all(self):
-        for i in range(8):
-            self._report[i] = 0
-        self._send()
-
-    def _send(self):
-        try:
-            self._dev.send_report(self._report)
-        except Exception as e:
-            print("KBD ERR", type(e).__name__, e)
-
-
-class MouseState:
-    def __init__(self, dev):
-        self._dev = dev
-        self.buttons = 0
-        self.x = 0
-        self.y = 0
-
-    def move(self, buttons, x, y, wheel):
-        self.buttons = buttons
-        self.x = x
-        self.y = y
-        self._send(wheel)
-
-    def set_buttons(self, buttons):
-        self.buttons = buttons
-        self._send(0)
-
-    def _send(self, wheel=0):
-        try:
-            self._dev.send_report(struct.pack("<BHHb", self.buttons, self.x, self.y, wheel))
-        except Exception as e:
-            print("MSE ERR", type(e).__name__, e)
-
-
-# Serial receive buffer — handles fragmented USB CDC reads
 _buf = bytearray(32)
 _buf_len = 0
 _pending_cmd = None
@@ -145,35 +57,29 @@ def poll_serial(serial, dispatch):
         _pending_need = 0
 
 
-# BLE + HID setup
-ble = BLERadio()
-ble.name = "ForwardHID"
-hid = HIDService(hid_descriptor=HID_DESCRIPTOR)
-advertisement = ProvideServicesAdvertisement(hid)
-
-# hid.devices order matches descriptor Report ID order: [0]=keyboard, [1]=mouse
-print("hid.devices:", len(hid.devices))
-for _i, _d in enumerate(hid.devices):
-    print(" [" + str(_i) + "]", type(_d).__name__,
-          "up=" + str(getattr(_d, "usage_page", "?")),
-          "u=" + str(getattr(_d, "usage", "?")))
-
-kbd_device = hid.devices[0]
-mouse_device = hid.devices[1]
-
-kbd = KbdState(kbd_device)
-mouse = MouseState(mouse_device)
-
-serial = usb_cdc.data
-state = "IDLE"
-_conn_time = 0
-
-
 def send_status(msg):
     try:
         serial.write((msg + "\n").encode())
     except Exception:
         pass
+
+
+def _apply_mod(new_mod):
+    # Sync modifier keys: host sends full current modifier bitmask.
+    # Bit i maps to keycode 0xE0+i (L-Ctrl, L-Shift, L-Alt, L-GUI, R-Ctrl, R-Shift, R-Alt, R-GUI).
+    global _current_mod
+    diff = _current_mod ^ new_mod
+    for i in range(8):
+        bit = 1 << i
+        if diff & bit:
+            try:
+                if new_mod & bit:
+                    keyboard.press(0xE0 + i)
+                else:
+                    keyboard.release(0xE0 + i)
+            except Exception as e:
+                print("MOD ERR", e)
+    _current_mod = new_mod
 
 
 def cmd_advertise():
@@ -184,65 +90,61 @@ def cmd_advertise():
         send_status("ADV")
 
 
-def cmd_mouse_move(payload):
-    if state == "CONN":
-        buttons = payload[0]
-        x = payload[1] | (payload[2] << 8)
-        y = payload[3] | (payload[4] << 8)
-        raw_wheel = payload[5]
-        wheel = raw_wheel if raw_wheel < 128 else raw_wheel - 256
-        mouse.move(buttons, x, y, wheel)
-
-
 def cmd_key_down(payload):
+    print("KEY_DOWN state=%s mod=%02x kc=%02x" % (state, payload[0], payload[1]))
     if state == "CONN":
-        kbd.key_down(payload[0], payload[1])
+        _apply_mod(payload[0])
+        if payload[1]:
+            try:
+                keyboard.press(payload[1])
+                print("press ok")
+            except Exception as e:
+                print("KBD ERR", e)
 
 
 def cmd_key_up(payload):
+    print("KEY_UP state=%s mod=%02x kc=%02x" % (state, payload[0], payload[1]))
     if state == "CONN":
-        kbd.key_up(payload[0], payload[1])
+        if payload[1]:
+            try:
+                keyboard.release(payload[1])
+            except Exception as e:
+                print("KBD ERR", e)
+        _apply_mod(payload[0])
 
 
 def cmd_release_all(_payload):
+    global _current_mod
     if state == "CONN":
-        kbd.release_all()
-
-
-def cmd_mouse_buttons(payload):
-    if state == "CONN":
-        mouse.set_buttons(payload[0])
+        keyboard.release_all()
+        _current_mod = 0
 
 
 DISPATCH = {
     0x01: lambda p: cmd_advertise(),
-    0x02: cmd_mouse_move,
     0x03: cmd_key_down,
     0x04: cmd_key_up,
     0x05: cmd_release_all,
-    0x06: cmd_mouse_buttons,
 }
 
 
 def poll_ble():
-    global state, _conn_time
+    global state, _conn_time, _current_mod
     if state == "ADV" and ble.connected:
-        # Give iOS time to discover services and subscribe to HID notifications
-        # before we start sending reports.
         _conn_time = time.monotonic()
         state = "WAIT"
         try:
             name = ble._connections[0]._connection._remote_name or "Unknown"
         except Exception:
             name = "Unknown"
-        print("BLE connected, waiting for HID setup:", name)
         send_status("CONN:" + name)
     elif state == "WAIT" and time.monotonic() - _conn_time >= 2.0:
         state = "CONN"
-        print("HID ready")
+        print("entered CONN state")
     elif state in ("CONN", "WAIT") and not ble.connected:
         state = "IDLE"
-        kbd.release_all()
+        _current_mod = 0
+        keyboard.release_all()
         send_status("DISC")
 
 
