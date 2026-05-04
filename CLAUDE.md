@@ -2,80 +2,102 @@
 
 ## What This Project Does
 
-BLE HID forwarder: Xiao nrf52840 (CircuitPython 10.2) receives mouse/keyboard commands over USB serial and replays them as BLE HID events (absolute mouse + keyboard) to a paired target device. Host UI is a single HTML file using Web Serial API.
+Current repo state: BLE keyboard forwarder.
+
+- The Xiao nrf52840 receives keyboard commands over USB serial.
+- It replays them as a BLE keyboard to the paired target device.
+- The host UI is a single `index.html` file using Web Serial.
+- The current firmware does not implement mouse forwarding.
 
 ## File Map
 
 | File | Role |
 |------|------|
-| `firmware/boot.py` | `usb_cdc.enable(console=True, data=True)` — must run before code.py |
-| `firmware/code.py` | BLE HID + serial command loop |
-| `index.html` | Web Serial host app — mirror area + keyboard capture |
-| `design.md` | Full spec: protocol tables, HID descriptor, state machine |
-
-Firmware files are copied to the **root of the CIRCUITPY drive** on the device.
+| `firmware/boot.py` | enables `usb_cdc` console and data ports |
+| `firmware/code.py` | BLE keyboard bridge and serial command loop |
+| `index.html` | serial host UI for live capture and send-text |
+| `README.md` | user-facing setup and usage |
+| `design.md` | full design / protocol spec |
 
 ## Serial Protocol Quick Reference
 
-### Host → Device (binary, fixed-length)
+### Host → Device
 
-```
+```text
 0x01              ADVERTISE         (1 byte total)
-0x02 B X0 X1 Y0 Y1 W  MOUSE_MOVE  (7 bytes: buttons, x LE, y LE, wheel signed)
-0x03 M K          KEY_DOWN         (3 bytes: modifier, keycode)
-0x04 M K          KEY_UP           (3 bytes: modifier, keycode)
-0x05              KEY_RELEASE_ALL  (1 byte)
-0x06 B            MOUSE_BUTTONS    (2 bytes: buttons)
+0x03 M K          KEY_DOWN          (3 bytes: modifier, keycode)
+0x04 M K          KEY_UP            (3 bytes: modifier, keycode)
+0x05              KEY_RELEASE_ALL   (1 byte)
 ```
 
-CMD_SIZES = `{0x01:0, 0x02:6, 0x03:2, 0x04:2, 0x05:0, 0x06:1}`
-
-### Device → Host (ASCII lines)
-
-```
-IDLE\n   ADV\n   CONN:<name>\n   DISC\n
+```python
+CMD_SIZES = {0x01: 0, 0x03: 2, 0x04: 2, 0x05: 0}
 ```
 
-## BLE HID Reports
+### Device → Host
 
-- Report ID 1 = Keyboard: `[modifier, 0x00, key0, key1, key2, key3, key4, key5]`
-- Report ID 2 = Absolute Mouse: `struct.pack("<BHHb", buttons, x, y, wheel)` (6 bytes)
-- X/Y range: 0–32767
-- `hid.devices[0]` = keyboard, `hid.devices[1]` = mouse (verify on first run)
-
-## Key Classes in `code.py`
-
-- `KbdState(dev)` — manages 8-byte keyboard report; `key_down(mod, kc)`, `key_up(mod, kc)`, `release_all()`
-- `MouseState(dev)` — manages mouse report; `move(buttons, x, y, wheel)`, `set_buttons(buttons)`
-- `poll_serial(serial)` — stateful fragmented-read parser, dispatches to command handlers
-- `poll_ble()` — checks BLE connection state, sends CONN/DISC status lines
-
-## BLE State Machine
-
-`IDLE` → (ADVERTISE cmd) → `ADV` → (ble.connected) → `CONN` → (!ble.connected) → `IDLE`
-
-Commands are only forwarded in `CONN` state. `release_all()` is called on disconnect.
-
-## Known Caveats
-
-- Web Serial requires Chromium-based browser (Chrome/Edge). Firefox and Safari do not support it.
-- Web Serial requires a secure context: serve `index.html` via `python3 -m http.server` (localhost).
-- Remote device name retrieval (`ble._connections[0]._connection._remote_name`) uses a private API and may break on adafruit_ble updates; defaults to "Unknown" on AttributeError.
-- Browser will intercept some key combos (Cmd+W, Cmd+Q, etc.) even with `preventDefault()`.
-- The `absolute_mouse` (neradoc) library is USB HID only — not used. BLE absolute mouse is implemented via custom HID descriptor.
-- `hid.devices` ordering depends on descriptor order; confirm Report ID → device index mapping on first hardware run.
-
-## HID Descriptor Summary
-
-142 bytes total. Keyboard (Report ID 1, 8-byte report) followed by Absolute Mouse (Report ID 2, 6-byte report). Full bytes in `design.md` § BLE HID and in `firmware/code.py`.
-
-## Modifier Byte Bitmask
-
+```text
+IDLE\n
+ADV\n
+CONN:<name>\n
+DISC\n
 ```
+
+## BLE HID Notes
+
+- `HIDService()` uses Adafruit's built-in HID descriptor.
+- `Keyboard(hid.devices)` finds the keyboard device automatically.
+- The firmware currently sends only keyboard reports.
+- `_apply_mod()` keeps modifier key state synchronized from the host's modifier bitmask.
+
+Modifier bit layout:
+
+```text
 bit0=L-Ctrl  bit1=L-Shift  bit2=L-Alt  bit3=L-GUI
 bit4=R-Ctrl  bit5=R-Shift  bit6=R-Alt  bit7=R-GUI
 ```
 
-## Button Byte Bitmask
+Modifier bit `i` maps to HID keycode `0xE0 + i`.
 
-`bit0 = left`, `bit1 = right`, `bit2 = middle`
+## Key Pieces in `firmware/code.py`
+
+- `poll_serial(serial, dispatch)` handles fragmented reads and fixed-length packets.
+- `_apply_mod(new_mod)` diffs the previous and current modifier bitmasks and presses or releases modifier keys.
+- `cmd_key_down(payload)` applies modifiers first, then presses the non-modifier key if present.
+- `cmd_key_up(payload)` releases the non-modifier key first, then applies the new modifier mask.
+- `cmd_release_all()` calls `keyboard.release_all()` and clears `_current_mod`.
+- `poll_ble()` transitions `IDLE -> ADV -> WAIT -> CONN` and resets state on disconnect.
+
+## Host UI Notes
+
+The current `index.html` supports two keyboard paths:
+
+1. Live capture
+   - global document-level `keydown` / `keyup`
+   - enabled by `Start Capture`
+   - disabled by `Stop Capture`, disconnect, or before send-text begins
+2. Send text
+   - textarea-driven
+   - ASCII-only using a US QWERTY `ASCII_MAP`
+   - sends down/up pairs with small delays for reliability
+
+## Debug Output
+
+The firmware prints debug messages to the console serial port, including:
+
+- `KEY_DOWN state=... mod=.. kc=..`
+- `KEY_UP state=... mod=.. kc=..`
+- `press ok`
+- `entered CONN state`
+- `KBD ERR ...`
+- `MOD ERR ...`
+
+These are not sent over the data serial port used by the web app.
+
+## Known Caveats
+
+- Mouse forwarding is currently out of scope for this branch.
+- Web Serial requires Chrome / Edge / another Chromium browser.
+- The UI and ASCII map assume US QWERTY layout.
+- Some browser / OS shortcuts may bypass the page.
+- Remote name lookup may return `Unknown` because it uses a private BLE connection field.
