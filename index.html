@@ -25,6 +25,7 @@
     display: flex;
     flex-direction: column;
     gap: 20px;
+    overflow-y: auto;
   }
 
   h1 { font-size: 16px; font-weight: 600; color: #fff; }
@@ -48,6 +49,20 @@
   button.primary:hover:not(:disabled) { background: #1d4ed8; }
   button.danger  { background: #dc2626; border-color: #dc2626; color: #fff; }
   button.danger:hover:not(:disabled)  { background: #b91c1c; }
+
+  textarea {
+    background: #1a1a1a;
+    color: #e0e0e0;
+    border: 1px solid #444;
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 13px;
+    font-family: system-ui, sans-serif;
+    resize: vertical;
+    width: 100%;
+    min-height: 80px;
+  }
+  textarea:focus { outline: none; border-color: #666; }
 
   #status-badge {
     display: flex;
@@ -76,16 +91,17 @@
     justify-content: center;
   }
 
-  #capture-indicator {
+  #capture-indicator, #send-indicator {
     display: none;
     flex-direction: column;
     align-items: center;
     gap: 12px;
-    color: #22c55e;
   }
-  #capture-indicator.active { display: flex; }
-  #capture-indicator .icon { font-size: 48px; animation: pulse 1.5s ease-in-out infinite; }
-  #capture-indicator .label { font-size: 13px; color: #666; }
+  #capture-indicator { color: #22c55e; }
+  #send-indicator    { color: #2563eb; }
+  #capture-indicator.active, #send-indicator.active { display: flex; }
+  #capture-indicator .icon, #send-indicator .icon { font-size: 48px; animation: pulse 1.5s ease-in-out infinite; }
+  #capture-indicator .label, #send-indicator .label { font-size: 13px; color: #666; }
 
   @keyframes pulse {
     0%, 100% { opacity: 1; }
@@ -112,12 +128,22 @@
     <div class="section-title">Keyboard</div>
     <button id="btn-capture" disabled>Start Capture</button>
   </div>
+
+  <div class="section">
+    <div class="section-title">Send Text</div>
+    <textarea id="txt-send" placeholder="Type or paste ASCII text…"></textarea>
+    <button id="btn-send" disabled>Send</button>
+  </div>
 </div>
 
 <div id="main">
   <div id="capture-indicator">
     <div class="icon">⌨</div>
     <div class="label">Forwarding all keystrokes</div>
+  </div>
+  <div id="send-indicator">
+    <div class="icon">📤</div>
+    <div class="label">Sending text…</div>
   </div>
 </div>
 
@@ -161,6 +187,35 @@ const KEY_MAP = {
   Numpad9:0x61, Numpad0:0x62, NumpadDecimal:0x63,
   PrintScreen:0x46, ScrollLock:0x47, Pause:0x48,
 };
+
+// ASCII character → [hid_keycode, modifier_byte] for US QWERTY layout
+const ASCII_MAP = (() => {
+  const m = {};
+  // a–z
+  for (let i = 0; i < 26; i++) {
+    m[String.fromCharCode(97 + i)] = [0x04 + i, 0x00];
+    m[String.fromCharCode(65 + i)] = [0x04 + i, 0x02]; // A–Z need Left Shift
+  }
+  // digits
+  [['1',0x1E],['2',0x1F],['3',0x20],['4',0x21],['5',0x22],
+   ['6',0x23],['7',0x24],['8',0x25],['9',0x26],['0',0x27]]
+    .forEach(([c,k]) => m[c] = [k, 0x00]);
+  // whitespace
+  m[' ']  = [0x2C, 0x00];
+  m['\n'] = [0x28, 0x00];
+  m['\t'] = [0x2B, 0x00];
+  // unshifted punctuation
+  [['-',0x2D],['=',0x2E],['[',0x2F],[']',0x30],['\\',0x31],
+   [';',0x33],["'",0x34],['`',0x35],[',',0x36],['.',0x37],['/',0x38]]
+    .forEach(([c,k]) => m[c] = [k, 0x00]);
+  // shifted punctuation
+  [['!',0x1E],['@',0x1F],['#',0x20],['$',0x21],['%',0x22],
+   ['^',0x23],['&',0x24],['*',0x25],['(',0x26],[')',0x27],
+   ['_',0x2D],['+',0x2E],['{',0x2F],['}',0x30],['|',0x31],
+   [':',0x33],['"',0x34],['~',0x35],['<',0x36],['>',0x37],['?',0x38]]
+    .forEach(([c,k]) => m[c] = [k, 0x02]);
+  return m;
+})();
 
 // ─── Serial state ────────────────────────────────────────────────────────────
 
@@ -211,6 +266,8 @@ btnCapture.addEventListener('click', () => setCapturing(!capturing));
 
 document.addEventListener('keydown', e => {
   if (!capturing) return;
+  // Don't intercept typing in the send-text area
+  if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
 
   e.preventDefault();
 
@@ -226,6 +283,7 @@ document.addEventListener('keydown', e => {
 
 document.addEventListener('keyup', e => {
   if (!capturing) return;
+  if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
   e.preventDefault();
 
   const modBit = MOD_MAP[e.code];
@@ -236,6 +294,35 @@ document.addEventListener('keyup', e => {
   }
   const kc = KEY_MAP[e.code];
   if (kc) sendKeyUp(currentMod, kc);
+});
+
+// ─── Send text ───────────────────────────────────────────────────────────────
+
+const btnSend      = document.getElementById('btn-send');
+const txtSend      = document.getElementById('txt-send');
+const sendIndicator = document.getElementById('send-indicator');
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+btnSend.addEventListener('click', async () => {
+  if (!writer) return;
+  if (capturing) setCapturing(false); // stop capture before sending
+  btnSend.disabled = true;
+  sendIndicator.classList.add('active');
+  const text = txtSend.value;
+  for (const ch of text) {
+    if (ch === '\r') continue; // skip bare CR; \n handles line breaks
+    const entry = ASCII_MAP[ch];
+    if (!entry) continue; // skip unsupported characters
+    const [kc, mod] = entry;
+    sendKeyDown(mod, kc);
+    await sleep(30);
+    sendKeyUp(0x00, kc); // release key and clear modifier
+    await sleep(20);
+  }
+  sendIndicator.classList.remove('active');
+  // Re-enable only if BLE is still connected
+  if (!btnCapture.disabled) btnSend.disabled = false;
 });
 
 // ─── Status display ──────────────────────────────────────────────────────────
@@ -256,10 +343,12 @@ function handleStatusLine(line) {
     setStatus('disc', 'Disconnected');
     setCapturing(false);
     btnCapture.disabled = true;
+    btnSend.disabled = true;
   } else if (line.startsWith('CONN:')) {
     const name = line.slice(5) || 'Unknown';
     setStatus('conn', 'Connected: ' + name);
     btnCapture.disabled = false;
+    btnSend.disabled = false;
   }
 }
 
@@ -311,6 +400,7 @@ async function readLoop() {
   btnConnect.disabled = false;
   btnPair.disabled = true;
   btnCapture.disabled = true;
+  btnSend.disabled = true;
   setStatus('disc', 'Serial disconnected');
 }
 </script>
