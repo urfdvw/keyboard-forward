@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>keyboard-forward</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: system-ui, sans-serif;
+    font-size: 14px;
+    background: #1a1a1a;
+    color: #e0e0e0;
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  #sidebar {
+    width: 240px;
+    min-width: 240px;
+    background: #242424;
+    border-right: 1px solid #333;
+    padding: 20px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    overflow-y: auto;
+  }
+
+  h1 { font-size: 16px; font-weight: 600; color: #fff; }
+
+  .section { display: flex; flex-direction: column; gap: 8px; }
+  .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #888; }
+
+  button {
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid #444;
+    background: #2e2e2e;
+    color: #e0e0e0;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.15s;
+  }
+  button:hover:not(:disabled) { background: #3a3a3a; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  button.primary:hover:not(:disabled) { background: #1d4ed8; }
+
+  #status-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: #1a1a1a;
+    font-size: 13px;
+  }
+  #status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: #555;
+  }
+  #status-badge.idle #status-dot    { background: #555; }
+  #status-badge.adv #status-dot     { background: #f59e0b; }
+  #status-badge.conn #status-dot    { background: #22c55e; }
+  #status-badge.disc #status-dot    { background: #ef4444; }
+
+  .input-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .input-row label { color: #999; font-size: 12px; white-space: nowrap; }
+  .input-row input {
+    flex: 1;
+    min-width: 0;
+    padding: 5px 8px;
+    border-radius: 5px;
+    border: 1px solid #444;
+    background: #1a1a1a;
+    color: #e0e0e0;
+    font-size: 13px;
+  }
+  .input-row input:focus { outline: none; border-color: #2563eb; }
+  .sep { color: #666; }
+
+  #main {
+    flex: 1;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-start;
+    padding: 20px;
+    overflow: auto;
+  }
+
+  #mirror {
+    background: #111;
+    border: 2px solid #333;
+    border-radius: 4px;
+    cursor: crosshair;
+    user-select: none;
+    outline: none;
+    flex-shrink: 0;
+    position: relative;
+  }
+  #mirror:focus { border-color: #2563eb; }
+  #mirror.connected { border-color: #22c55e44; }
+  #mirror-hint {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #444;
+    font-size: 13px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <h1>keyboard-forward</h1>
+
+  <div class="section">
+    <div class="section-title">Connection</div>
+    <button id="btn-connect" class="primary">Connect Serial</button>
+    <button id="btn-pair" disabled>Pair BLE</button>
+    <div id="status-badge" class="idle">
+      <div id="status-dot"></div>
+      <span id="status-text">Idle</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Target Resolution</div>
+    <div class="input-row">
+      <input id="res-w" type="number" value="2360" min="1" max="9999">
+      <span class="sep">×</span>
+      <input id="res-h" type="number" value="1640" min="1" max="9999">
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Mirror Width (px)</div>
+    <div class="input-row">
+      <input id="mirror-w" type="number" value="600" min="100" max="3000">
+      <label>px</label>
+    </div>
+  </div>
+</div>
+
+<div id="main">
+  <div id="mirror" tabindex="0">
+    <div id="mirror-hint">Move cursor here to control target device</div>
+  </div>
+</div>
+
+<script>
+// ─── HID keycode maps ────────────────────────────────────────────────────────
+
+const MOD_MAP = {
+  ControlLeft: 0x01, ShiftLeft: 0x02, AltLeft: 0x04, MetaLeft: 0x08,
+  ControlRight: 0x10, ShiftRight: 0x20, AltRight: 0x40, MetaRight: 0x80,
+};
+
+const KEY_MAP = {
+  // Letters
+  KeyA:0x04, KeyB:0x05, KeyC:0x06, KeyD:0x07, KeyE:0x08, KeyF:0x09,
+  KeyG:0x0A, KeyH:0x0B, KeyI:0x0C, KeyJ:0x0D, KeyK:0x0E, KeyL:0x0F,
+  KeyM:0x10, KeyN:0x11, KeyO:0x12, KeyP:0x13, KeyQ:0x14, KeyR:0x15,
+  KeyS:0x16, KeyT:0x17, KeyU:0x18, KeyV:0x19, KeyW:0x1A, KeyX:0x1B,
+  KeyY:0x1C, KeyZ:0x1D,
+  // Digits (Digit0 = 0x27)
+  Digit1:0x1E, Digit2:0x1F, Digit3:0x20, Digit4:0x21, Digit5:0x22,
+  Digit6:0x23, Digit7:0x24, Digit8:0x25, Digit9:0x26, Digit0:0x27,
+  // Special
+  Enter:0x28, Escape:0x29, Backspace:0x2A, Tab:0x2B, Space:0x2C,
+  // Punctuation (US QWERTY)
+  Minus:0x2D, Equal:0x2E, BracketLeft:0x2F, BracketRight:0x30,
+  Backslash:0x31, Semicolon:0x33, Quote:0x34, Backquote:0x35,
+  Comma:0x36, Period:0x37, Slash:0x38,
+  // Function keys + caps
+  CapsLock:0x39,
+  F1:0x3A, F2:0x3B, F3:0x3C, F4:0x3D, F5:0x3E, F6:0x3F,
+  F7:0x40, F8:0x41, F9:0x42, F10:0x43, F11:0x44, F12:0x45,
+  // Navigation
+  Insert:0x49, Home:0x4A, PageUp:0x4B, Delete:0x4C,
+  End:0x4D, PageDown:0x4E,
+  ArrowRight:0x4F, ArrowLeft:0x50, ArrowDown:0x51, ArrowUp:0x52,
+  // Numpad
+  NumLock:0x53, NumpadDivide:0x54, NumpadMultiply:0x55,
+  NumpadSubtract:0x56, NumpadAdd:0x57, NumpadEnter:0x58,
+  Numpad1:0x59, Numpad2:0x5A, Numpad3:0x5B, Numpad4:0x5C,
+  Numpad5:0x5D, Numpad6:0x5E, Numpad7:0x5F, Numpad8:0x60,
+  Numpad9:0x61, Numpad0:0x62, NumpadDecimal:0x63,
+  // PrintScreen / Scroll / Pause
+  PrintScreen:0x46, ScrollLock:0x47, Pause:0x48,
+};
+
+// ─── Serial state ────────────────────────────────────────────────────────────
+
+let port = null;
+let writer = null;
+let serialConnected = false;
+
+// ─── Input state ─────────────────────────────────────────────────────────────
+
+let mouseButtons = 0;
+let currentMod = 0;
+let lastHID = { x: 0, y: 0 };
+
+// ─── Protocol helpers ────────────────────────────────────────────────────────
+
+function sendBytes(arr) {
+  if (!writer) return;
+  writer.write(new Uint8Array(arr)).catch(() => {});
+}
+
+function sendMouseMove(hx, hy, buttons, wheel) {
+  const w = wheel < 0 ? wheel + 256 : wheel;
+  sendBytes([0x02, buttons, hx & 0xFF, hx >> 8, hy & 0xFF, hy >> 8, w]);
+}
+
+function sendMouseButtons(buttons) {
+  sendBytes([0x06, buttons]);
+}
+
+function sendKeyDown(mod, kc) {
+  sendBytes([0x03, mod, kc]);
+}
+
+function sendKeyUp(mod, kc) {
+  sendBytes([0x04, mod, kc]);
+}
+
+function sendReleaseAll() {
+  sendBytes([0x05]);
+}
+
+function sendAdvertise() {
+  sendBytes([0x01]);
+}
+
+// ─── HID coordinate calculation ──────────────────────────────────────────────
+
+function getHIDCoords(e) {
+  const r = mirror.getBoundingClientRect();
+  const x = Math.max(0, Math.min(32767, Math.round((e.clientX - r.left) / r.width * 32767)));
+  const y = Math.max(0, Math.min(32767, Math.round((e.clientY - r.top) / r.height * 32767)));
+  return { x, y };
+}
+
+// ─── Mirror size ─────────────────────────────────────────────────────────────
+
+const mirror = document.getElementById('mirror');
+const resWInput = document.getElementById('res-w');
+const resHInput = document.getElementById('res-h');
+const mirrorWInput = document.getElementById('mirror-w');
+
+function updateMirrorSize() {
+  const rw = Math.max(1, parseInt(resWInput.value) || 1);
+  const rh = Math.max(1, parseInt(resHInput.value) || 1);
+  const mw = Math.max(100, parseInt(mirrorWInput.value) || 600);
+  const mh = Math.round(mw * rh / rw);
+  mirror.style.width = mw + 'px';
+  mirror.style.height = mh + 'px';
+}
+
+resWInput.addEventListener('input', updateMirrorSize);
+resHInput.addEventListener('input', updateMirrorSize);
+mirrorWInput.addEventListener('input', updateMirrorSize);
+updateMirrorSize();
+
+// ─── Status display ──────────────────────────────────────────────────────────
+
+const badge = document.getElementById('status-badge');
+const statusText = document.getElementById('status-text');
+
+function setStatus(cls, text) {
+  badge.className = cls;
+  statusText.textContent = text;
+}
+
+function handleStatusLine(line) {
+  line = line.trim();
+  if (line === 'IDLE')       setStatus('idle', 'Idle');
+  else if (line === 'ADV')   setStatus('adv', 'Advertising…');
+  else if (line === 'DISC')  setStatus('disc', 'Disconnected');
+  else if (line.startsWith('CONN:')) {
+    const name = line.slice(5) || 'Unknown';
+    setStatus('conn', 'Connected: ' + name);
+    mirror.classList.add('connected');
+  }
+}
+
+// ─── Serial connection ────────────────────────────────────────────────────────
+
+const btnConnect = document.getElementById('btn-connect');
+const btnPair = document.getElementById('btn-pair');
+
+btnConnect.addEventListener('click', connectSerial);
+btnPair.addEventListener('click', () => sendAdvertise());
+
+async function connectSerial() {
+  if (!('serial' in navigator)) {
+    alert('Web Serial not supported. Use Chrome or Edge.');
+    return;
+  }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    writer = port.writable.getWriter();
+    serialConnected = true;
+    btnConnect.disabled = true;
+    btnPair.disabled = false;
+    setStatus('idle', 'Idle');
+    readLoop();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function readLoop() {
+  const decoder = new TextDecoder();
+  let buf = '';
+  try {
+    const reader = port.readable.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (line.trim()) handleStatusLine(line);
+      }
+    }
+  } catch (e) {
+    console.error(e);
+  }
+  serialConnected = false;
+  btnConnect.disabled = false;
+  btnPair.disabled = true;
+  setStatus('disc', 'Serial disconnected');
+  mirror.classList.remove('connected');
+}
+
+// ─── Mirror mouse events ──────────────────────────────────────────────────────
+
+mirror.addEventListener('mouseenter', () => mirror.focus());
+
+mirror.addEventListener('mouseleave', () => {
+  sendReleaseAll();
+  mouseButtons = 0;
+  currentMod = 0;
+});
+
+mirror.addEventListener('contextmenu', e => e.preventDefault());
+
+mirror.addEventListener('pointermove', e => {
+  const hid = getHIDCoords(e);
+  lastHID = hid;
+  sendMouseMove(hid.x, hid.y, mouseButtons, 0);
+});
+
+mirror.addEventListener('mousedown', e => {
+  e.preventDefault();
+  const bit = e.button === 0 ? 0x01 : e.button === 2 ? 0x02 : e.button === 1 ? 0x04 : 0;
+  mouseButtons |= bit;
+  sendMouseButtons(mouseButtons);
+});
+
+mirror.addEventListener('mouseup', e => {
+  const bit = e.button === 0 ? 0x01 : e.button === 2 ? 0x02 : e.button === 1 ? 0x04 : 0;
+  mouseButtons &= ~bit & 0xFF;
+  sendMouseButtons(mouseButtons);
+});
+
+mirror.addEventListener('wheel', e => {
+  e.preventDefault();
+  const delta = Math.max(-127, Math.min(127, Math.round(e.deltaY / 10)));
+  if (delta !== 0) {
+    sendMouseMove(lastHID.x, lastHID.y, mouseButtons, delta);
+  }
+}, { passive: false });
+
+// ─── Mirror keyboard events ───────────────────────────────────────────────────
+
+mirror.addEventListener('keydown', e => {
+  e.preventDefault();
+  const modBit = MOD_MAP[e.code];
+  if (modBit) {
+    currentMod |= modBit;
+    sendKeyDown(currentMod, 0x00);
+    return;
+  }
+  const kc = KEY_MAP[e.code];
+  if (kc) sendKeyDown(currentMod, kc);
+});
+
+mirror.addEventListener('keyup', e => {
+  e.preventDefault();
+  const modBit = MOD_MAP[e.code];
+  if (modBit) {
+    currentMod &= ~modBit & 0xFF;
+    sendKeyUp(currentMod, 0x00);
+    return;
+  }
+  const kc = KEY_MAP[e.code];
+  if (kc) sendKeyUp(currentMod, kc);
+});
+</script>
+</body>
+</html>
